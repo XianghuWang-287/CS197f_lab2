@@ -1,0 +1,330 @@
+diff --git a/grade-lab-alloc b/grade-lab-alloc
+index 8d6930f..c67b3bd 100755
+--- a/grade-lab-alloc
++++ b/grade-lab-alloc
+@@ -31,7 +31,7 @@ def test_memtest():
+ def test_usertests():
+     r.run_qemu(shell_script([
+         'usertests'
+-    ]), timeout=150)
++    ]),timeout=200)
+ 
+ def usertest_check(testcase, nextcase, output):
+     if not re.search(r'\ntest {}: [\s\S]*OK\ntest {}'.format(testcase, nextcase), output):
+diff --git a/kernel/file.c b/kernel/file.c
+index e8dcf17..e0febd5 100644
+--- a/kernel/file.c
++++ b/kernel/file.c
+@@ -16,7 +16,6 @@
+ struct devsw devsw[NDEV];
+ struct {
+   struct spinlock lock;
+-  struct file file[NFILE];
+ } ftable;
+ 
+ void
+@@ -30,17 +29,14 @@ struct file*
+ filealloc(void)
+ {
+   struct file *f;
+-
++  
+   acquire(&ftable.lock);
+-  for(f = ftable.file; f < ftable.file + NFILE; f++){
+-    if(f->ref == 0){
+-      f->ref = 1;
+-      release(&ftable.lock);
+-      return f;
+-    }
+-  }
++  f=bd_malloc(sizeof(struct file));
++  memset(f,0,sizeof(struct file));
++  f->ref=1;
+   release(&ftable.lock);
+-  return 0;
++  return f;
++ // return 0;
+ }
+ 
+ // Increment ref count for file f.
+@@ -60,7 +56,6 @@ void
+ fileclose(struct file *f)
+ {
+   struct file ff;
+-
+   acquire(&ftable.lock);
+   if(f->ref < 1)
+     panic("fileclose");
+@@ -72,14 +67,14 @@ fileclose(struct file *f)
+   f->ref = 0;
+   f->type = FD_NONE;
+   release(&ftable.lock);
+-
+-  if(ff.type == FD_PIPE){
++   if(ff.type == FD_PIPE){
+     pipeclose(ff.pipe, ff.writable);
+   } else if(ff.type == FD_INODE || ff.type == FD_DEVICE){
+     begin_op(ff.ip->dev);
+     iput(ff.ip);
+     end_op(ff.ip->dev);
+   }
++  bd_free(f);
+ }
+ 
+ // Get metadata about file f.
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 9a0f827..94b54e9 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -69,6 +69,10 @@ int
+ argaddr(int n, uint64 *ip)
+ {
+   *ip = argraw(n);
++  if(*ip >= myproc()->sz)
++    {
++        return -1;
++    }
+   return 0;
+ }
+ 
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 789d69e..395ec4f 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -434,6 +434,7 @@ sys_exec(void)
+     if(argv[i] == 0)
+       panic("sys_exec kalloc");
+     if(fetchstr(uarg, argv[i], PGSIZE) < 0){
++      kfree(argv[i]);
+       return -1;
+     }
+   }
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..175e67b 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -47,9 +47,13 @@ sys_sbrk(void)
+   if(argint(0, &n) < 0)
+     return -1;
+   addr = myproc()->sz;
+-  if(growproc(n) < 0)
+-    return -1;
+-  return addr;
++  if((addr+n)>MAXVA||(addr+n)<0) return -1;
++  myproc()->sz+=n;
++  if(n<0)
++  { 
++     uvmdealloc(myproc()->pagetable,addr,myproc()->sz);
++  }
++   return addr;
+ }
+ 
+ uint64
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 51a7805..8f395bd 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -67,11 +67,36 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
+-  } else {
++  } else if(r_scause()==13 || r_scause()==15){
++       
++       	 char* mem;
++    	 uint64 va=r_stval();
++    	      
++         if(va>=p->sz)
++	    { p->killed=1;
++	      exit(-1);
++	     }
++         va=PGROUNDDOWN(va);
++	 if(va<p->tf->sp){
++            p->killed=1;
++            exit(-1);    }
++	 mem=kalloc();
++         if(mem==0)
++       	 {
++	       exit(-1);
++          }
++          memset(mem,0,PGSIZE);
++          if(mappages(p->pagetable,va,PGSIZE,(uint64)mem,PTE_W|PTE_X|PTE_R|PTE_U)!=0)
++	    {
++	       kfree(mem);
++	       exit(-1);
++	    }
++    }
++    else{
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+     p->killed = 1;
+-  }
++    }
+ 
+   if(p->killed)
+     exit(-1);
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 2b99c8b..57df1b3 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -5,7 +5,8 @@
+ #include "riscv.h"
+ #include "defs.h"
+ #include "fs.h"
+-
++#include "spinlock.h"
++#include "proc.h"
+ /*
+  * the kernel's page table.
+  */
+@@ -103,12 +104,27 @@ walkaddr(pagetable_t pagetable, uint64 va)
+ {
+   pte_t *pte;
+   uint64 pa;
+-
+   pte = walk(pagetable, va, 0);
+-  if(pte == 0)
++  struct proc *p = myproc();
++  //if(va>MAXVA) return 0;
++ /* if(pte == 0)
+     return 0;
+   if((*pte & PTE_V) == 0)
+-    return 0;
++    return 0;*/
++  if(pte == 0 || (*pte&PTE_V)==0)
++  {   if(va>=p->sz) return 0;
++      if(va<p->tf->sp) return 0;
++      char *mem=kalloc();
++      if(mem==0) return 0;
++      memset(mem,0,PGSIZE);
++      uint64 a=PGROUNDUP(va);
++      if(mappages(p->pagetable,a,PGSIZE,(uint64)mem,PTE_W|PTE_X|PTE_R|PTE_U)!=0)
++      {
++        kfree(mem);
++	return 0;
++      }
++      pte=walk(pagetable,va,0);
++  }
+   if((*pte & PTE_U) == 0)
+     return 0;
+   pa = PTE2PA(*pte);
+@@ -184,11 +200,21 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
+   a = PGROUNDDOWN(va);
+   last = PGROUNDDOWN(va + size - 1);
+   for(;;){
+-    if((pte = walk(pagetable, a, 0)) == 0)
+-      panic("uvmunmap: walk");
++    if((pte = walk(pagetable, a, 0)) == 0){
++     // panic("uvmunmap: walk");
++    if(a == last)
++      break;
++    a += PGSIZE;
++    pa += PGSIZE;
++     continue;}
+     if((*pte & PTE_V) == 0){
+-      printf("va=%p pte=%p\n", a, *pte);
+-      panic("uvmunmap: not mapped");
++     // printf("va=%p pte=%p\n", a, *pte);
++     // panic("uvmunmap: not mapped");
++    if(a == last)
++      break;
++    a += PGSIZE;
++    pa += PGSIZE;
++     continue;
+     }
+     if(PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+@@ -289,6 +315,7 @@ freewalk(pagetable_t pagetable)
+       pagetable[i] = 0;
+     } else if(pte & PTE_V){
+       panic("freewalk: leaf");
++      //pagetable[i] = 0;
+     }
+   }
+   kfree((void*)pagetable);
+@@ -319,9 +346,11 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+-      panic("uvmcopy: pte should exist");
++      //panic("uvmcopy: pte should exist");
++      continue;
+     if((*pte & PTE_V) == 0)
+-      panic("uvmcopy: page not present");
++      //panic("uvmcopy: page not present");
++      continue;
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+     if((mem = kalloc()) == 0)
+@@ -360,11 +389,23 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+   uint64 n, va0, pa0;
+ 
++  //struct proc *p=myproc();
+   while(len > 0){
+     va0 = (uint)PGROUNDDOWN(dstva);
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
++    {
++    
++      /*char *mem=kalloc();
++      if(mem==0) return 0;
++      memset(mem,0,PGSIZE);
++      if(mappages(p->pagetable,va0,PGSIZE,(uint64)mem,PTE_W|PTE_X|PTE_R|PTE_U)!=0)
++      {
++        kfree(mem);
++	return 0;
++      }*/
+       return -1;
++    }
+     n = PGSIZE - (dstva - va0);
+     if(n > len)
+       n = len;
+@@ -385,11 +426,22 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+ {
+   uint64 n, va0, pa0;
+ 
++ // struct proc *p=myproc();
+   while(len > 0){
+     va0 = (uint)PGROUNDDOWN(srcva);
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
+-      return -1;
++    {
++      /*char *mem=kalloc();
++      if(mem==0) return 0;
++      memset(mem,0,PGSIZE);
++      if(mappages(p->pagetable,va0,PGSIZE,(uint64)mem,PTE_W|PTE_X|PTE_R|PTE_U)!=0)
++      {
++        kfree(mem);
++	return 0;
++      }*/
++     return -1;
++    }
+     n = PGSIZE - (srcva - va0);
+     if(n > len)
+       n = len;
+@@ -411,12 +463,22 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+ {
+   uint64 n, va0, pa0;
+   int got_null = 0;
+-
++  //struct proc *p=myproc();
+   while(got_null == 0 && max > 0){
+     va0 = (uint)PGROUNDDOWN(srcva);
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
++    {
++      /*char *mem=kalloc();
++      if(mem==0) return 0;
++      memset(mem,0,PGSIZE);
++      if(mappages(p->pagetable,va0,PGSIZE,(uint64)mem,PTE_W|PTE_X|PTE_R|PTE_U)!=0)
++      {
++        kfree(mem);
++	return 0;
++      }*/
+       return -1;
++    }
+     n = PGSIZE - (srcva - va0);
+     if(n > max)
+       n = max;

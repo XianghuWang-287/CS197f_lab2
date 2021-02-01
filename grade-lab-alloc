@@ -1,0 +1,74 @@
+#!/usr/bin/env python
+
+import re
+from gradelib import *
+
+r = Runner(save("xv6.out"))
+
+@test(50, "Task1 grading: alloctest (50/100)")
+def test_alloctest():
+    r.run_qemu(shell_script([
+        'alloctest'
+    ]))
+    r.match("^filetest: OK$")
+
+ 
+@test(0, "Task2 grading: lazytests (25/100)")
+def test_lazytests():
+    r.run_qemu(shell_script([
+        'lazytests'
+    ]))
+
+@test(10, "lazy: map", parent=test_lazytests)
+def test_filetest():
+    r.match("^test lazy unmap: OK$")
+
+@test(15, "lazy: unmap", parent=test_lazytests)
+def test_memtest():
+    r.match("test lazy alloc: OK$")
+
+@test(0, "Task2 grading: usertests (25/100)")
+def test_usertests():
+    r.run_qemu(shell_script([
+        'usertests'
+    ]),timeout=200)
+
+def usertest_check(testcase, nextcase, output):
+    if not re.search(r'\ntest {}: [\s\S]*OK\ntest {}'.format(testcase, nextcase), output):
+        raise AssertionError('Failed ' + testcase)
+
+@test(2, "usertests: pgbug", parent=test_usertests)
+def test_pgbug():
+    usertest_check("pgbug", "sbrkbugs", r.qemu.output)
+
+@test(2, "usertests: sbrkbugs", parent=test_usertests)
+def test_sbrkbugs():
+    usertest_check("sbrkbugs", "badarg", r.qemu.output)
+
+@test(2, "usertests: argptest", parent=test_usertests)
+def test_argptest():
+    usertest_check("argptest", "createdelete", r.qemu.output)
+
+@test(2, "usertests: sbrkmuch", parent=test_usertests)
+def test_sbrkmuch():
+    usertest_check("sbrkmuch", "kernmem", r.qemu.output)
+
+@test(2, "usertests: sbrkfail", parent=test_usertests)
+def test_sbrkfail():
+    usertest_check("sbrkfail", "sbrkarg", r.qemu.output)
+
+@test(2, "usertests: sbrkarg", parent=test_usertests)
+def test_sbrkarg():
+    usertest_check("sbrkarg", "validatetest", r.qemu.output)
+
+@test(2, "usertests: stacktest", parent=test_usertests)
+def test_stacktest():
+    usertest_check("stacktest", "opentest", r.qemu.output)
+
+@test(11, "usertests: all tests", parent=test_usertests)
+def test_usertests_all():
+    r.match('^ALL TESTS PASSED$')    
+    
+    
+
+run_tests()
